@@ -1,28 +1,34 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Launches both the admin server (background, internal port 8081) and
+# hermes-webui (foreground, on Railway's public $PORT).
+#
+# Railway health-checks the public $PORT, so WebUI's /health is what answers.
+# The admin server is reachable only from inside the container.
+
 set -e
 
-# Mirror dashboard-ref-only's startup: create every directory hermes expects
-# and seed a default config.yaml if the volume is empty. Without these,
-# `hermes dashboard` endpoints that hit logs/, sessions/, cron/, etc. can fail
-# with opaque errors even though no auth is actually involved.
-mkdir -p /data/.hermes/cron /data/.hermes/sessions /data/.hermes/logs \
-         /data/.hermes/memories /data/.hermes/skills /data/.hermes/pairing \
-         /data/.hermes/hooks /data/.hermes/image_cache /data/.hermes/audio_cache \
-         /data/.hermes/workspace
+# ── Public-facing WebUI port ────────────────────────────────────────────────
+# Railway injects $PORT. WebUI reads HERMES_WEBUI_PORT.
+export HERMES_WEBUI_PORT="${PORT:-8787}"
 
-if [ ! -f /data/.hermes/config.yaml ] && [ -f /opt/hermes-agent/cli-config.yaml.example ]; then
-  cp /opt/hermes-agent/cli-config.yaml.example /data/.hermes/config.yaml
-fi
+# ── Admin server port (internal only) ───────────────────────────────────────
+# /app/server.py reads os.environ["PORT"] for its own port.
+# We override $PORT just for the admin server so WebUI keeps the public one.
+export PORT=8081
 
-[ ! -f /data/.hermes/.env ] && touch /data/.hermes/.env
+# ── Background: admin server (also auto-starts `hermes gateway` subprocess) ─
+echo "[start.sh] Launching admin server on internal port ${PORT}..."
+python /app/server.py &
+ADMIN_PID=$!
 
-# Clear any stale gateway PID file left over from the previous container.
-# `hermes gateway` writes /data/.hermes/gateway.pid on start but does not
-# remove it on SIGTERM. Since /data is a persistent volume, the file
-# survives container restarts and causes every subsequent boot to exit with
-# "ERROR gateway.run: PID file race lost to another gateway instance".
-# No hermes process can be running at this point (we're pre-exec in a fresh
-# container), so removing the file unconditionally is safe.
-rm -f /data/.hermes/gateway.pid
+# Forward signals so Railway shutdowns are clean
+trap "kill -TERM ${ADMIN_PID} 2>/dev/null; exit 0" TERM INT
 
-exec python /app/server.py
+# Give the admin server a moment to spin up before WebUI starts
+sleep 2
+
+# ── Foreground: hermes-webui on the public port ─────────────────────────────
+# cd into hermes-agent so run_agent.py's relative imports resolve.
+echo "[start.sh] Launching hermes-webui on public port ${HERMES_WEBUI_PORT}..."
+cd /opt/hermes-agent
+exec python /opt/hermes-webui/server.py
